@@ -160,3 +160,102 @@ code = '''
     assert(err == LFS_ERR_NOCONTIG || err == LFS_ERR_NOSPC);
     lfs_unmount(&lfs) => 0;
 '''
+
+# The committed tag claims the run, but the allocator advances its lookahead by
+# handing blocks out; an extent's blocks were never handed out, so without a
+# rescan the next file written in the same session lands on the payload. This
+# is the packer case: several files are written after the extent.
+[cases.test_extent_survives_later_allocations]
+code = '''
+    lfs_t lfs;
+    lfs_format(&lfs, cfg) => 0;
+    lfs_mount(&lfs, cfg) => 0;
+
+    // prime the allocator's lookahead with an ordinary file first
+    uint8_t primed[2000];
+    memset(primed, 0x11, sizeof(primed));
+    lfs_file_t file;
+    lfs_file_open(&lfs, &file, "first.bin",
+            LFS_O_WRONLY | LFS_O_CREAT | LFS_O_EXCL) => 0;
+    lfs_file_write(&lfs, &file, primed, sizeof(primed)) => sizeof(primed);
+    lfs_file_close(&lfs, &file) => 0;
+
+    uint8_t data[4000];
+    for (int i = 0; i < (int)sizeof(data); i++) {
+        data[i] = (uint8_t)(i*7+1);
+    }
+    lfs_ext_t ext;
+    lfs_ext_reserve(&lfs, sizeof(data), 4, &ext) => 0;
+    lfs_ext_write(&lfs, 0, data, sizeof(data)) => 0;
+    lfs_ext_commit(&lfs, "core.bin", 0) => 0;
+
+    // an ordinary file written afterwards must not reuse the run
+    uint8_t other[8000];
+    memset(other, 0x5a, sizeof(other));
+    lfs_file_open(&lfs, &file, "later.bin",
+            LFS_O_WRONLY | LFS_O_CREAT | LFS_O_EXCL) => 0;
+    lfs_file_write(&lfs, &file, other, sizeof(other)) => sizeof(other);
+    lfs_file_close(&lfs, &file) => 0;
+
+    lfs_file_open(&lfs, &file, "core.bin", LFS_O_RDONLY) => 0;
+    uint8_t back[4000];
+    lfs_file_read(&lfs, &file, back, sizeof(back)) => sizeof(back);
+    lfs_file_close(&lfs, &file) => 0;
+    assert(memcmp(back, data, sizeof(data)) == 0);
+
+    lfs_unmount(&lfs) => 0;
+'''
+
+# The allocator advances its lookahead by handing blocks out. An extent's
+# blocks never went through lfs_alloc(), so after the commit the current
+# lookahead window still reads them as free, and the next writes land on the
+# payload (this is what a packer does when it writes more files after the
+# extent). The image is small so the window wraps onto the run.
+[cases.test_extent_survives_later_allocations_small_image]
+defines.ERASE_SIZE = [4096]
+defines.ERASE_COUNT = [64]
+code = '''
+    lfs_t lfs;
+    lfs_format(&lfs, cfg) => 0;
+    lfs_mount(&lfs, cfg) => 0;
+
+    uint8_t buf[8192];
+    memset(buf, 0x11, sizeof(buf));
+    lfs_file_t file;
+    for (int i = 0; i < 8; i++) {
+        char name[8] = {'b', (char)('0'+i), 0};
+        lfs_file_open(&lfs, &file, name,
+                LFS_O_WRONLY | LFS_O_CREAT | LFS_O_EXCL) => 0;
+        lfs_file_write(&lfs, &file, buf, sizeof(buf)) => sizeof(buf);
+        lfs_file_close(&lfs, &file) => 0;
+    }
+
+    uint8_t data[4*4096];
+    for (int i = 0; i < (int)sizeof(data); i++) {
+        data[i] = (uint8_t)(i*7+1);
+    }
+    lfs_ext_t ext;
+    lfs_ext_reserve(&lfs, sizeof(data), 4, &ext) => 0;
+    lfs_ext_write(&lfs, 0, data, sizeof(data)) => 0;
+    lfs_ext_commit(&lfs, "core", 0) => 0;
+
+    // ordinary files written afterwards must not reuse the run
+    memset(buf, 0x5a, sizeof(buf));
+    for (int i = 0; i < 12; i++) {
+        char name[8] = {'a', (char)('0'+i/10), (char)('0'+i%10), 0};
+        if (lfs_file_open(&lfs, &file, name,
+                LFS_O_WRONLY | LFS_O_CREAT | LFS_O_EXCL) < 0) {
+            break;
+        }
+        lfs_file_write(&lfs, &file, buf, sizeof(buf));
+        lfs_file_close(&lfs, &file) => 0;
+    }
+
+    uint8_t back[4*4096];
+    lfs_file_open(&lfs, &file, "core", LFS_O_RDONLY) => 0;
+    lfs_file_read(&lfs, &file, back, sizeof(back)) => sizeof(back);
+    lfs_file_close(&lfs, &file) => 0;
+    assert(memcmp(back, data, sizeof(data)) == 0);
+
+    lfs_unmount(&lfs) => 0;
+'''

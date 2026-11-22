@@ -24,7 +24,10 @@ extent descriptor instead of CTZ or inline data:
 
 The tag is `LFS_TYPE_EXTSTRUCT` (`0x203`). The run is contiguous and
 immutable: it is written once through `lfs_ext_write()`, then frozen by
-`lfs_ext_commit()`. Opening an extent for writing or truncating it converts
+`lfs_ext_commit()`. Committing drops the allocator's lookahead window, because
+the run's blocks never went through `lfs_alloc()` and the window still reads
+them as free; the next allocation rescans the tree (which counts extents)
+instead of writing over the payload. Opening an extent for writing or truncating it converts
 the file back to ordinary littlefs data, and the run's blocks become free.
 
 A run is chosen by `lfs_ext_reserve()`, which finds a window of free blocks

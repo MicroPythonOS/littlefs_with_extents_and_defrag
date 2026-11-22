@@ -6733,11 +6733,19 @@ int lfs_ext_commit(lfs_t *lfs, const char *path, uint32_t crc) {
                 {LFS_MKTAG(LFS_TYPE_EXTSTRUCT, id, sizeof(ext)), &ext}));
     }
 
+    // The tag now claims the run, but the allocator advances by handing
+    // blocks out and these never went through lfs_alloc, so its lookahead
+    // still reads them as free. Drop it: the next allocation rescans the
+    // tree, which counts the extent, instead of writing over the payload.
+    lfs_alloc_drop(lfs);
     lfs_ext_clear_exclude(lfs);
     return err;
 }
 
 void lfs_ext_abort(lfs_t *lfs) {
+    // An aborted run leaves its blocks free; drop the lookahead so they are
+    // offered again instead of being skipped until the next scan.
+    lfs_alloc_drop(lfs);
     lfs_ext_clear_exclude(lfs);
 }
 #endif
