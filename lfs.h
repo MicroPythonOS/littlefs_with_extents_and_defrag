@@ -21,14 +21,27 @@ extern "C"
 // Software library version
 // Major (top-nibble), incremented on backwards incompatible changes
 // Minor (bottom-nibble), incremented on feature additions
-#define LFS_VERSION 0x0002000b
+#define LFS_VERSION 0x0002000c
 #define LFS_VERSION_MAJOR (0xffff & (LFS_VERSION >> 16))
 #define LFS_VERSION_MINOR (0xffff & (LFS_VERSION >>  0))
 
 // Version of On-disk data structures
 // Major (top-nibble), incremented on backwards incompatible changes
 // Minor (bottom-nibble), incremented on feature additions
+//
+// littlefs2e (extent files) keeps the standard 2.1 disk version. The
+// metadata format and every tag older littlefs knows are unchanged; an
+// extent is a new tag that stock littlefs ignores. A stock littlefs can
+// therefore mount the image, but it treats the extent's blocks as free
+// space, so stock tools must be treated as read-only. The stored CRC
+// detects a stock write or flash corruption.
 #define LFS_DISK_VERSION 0x00020001
+
+// Fixed bookkeeping for an in-flight extent reservation or defrag window.
+// 1024 bytes covers 8192 blocks, i.e. a 32 MiB filesystem at 4 KiB blocks.
+// littlefs is built with LFS_NO_MALLOC on MicroPython, so the extent code
+// must not call the allocator.
+#define LFS_EXT_MAP_MAX 1024
 #define LFS_DISK_VERSION_MAJOR (0xffff & (LFS_DISK_VERSION >> 16))
 #define LFS_DISK_VERSION_MINOR (0xffff & (LFS_DISK_VERSION >>  0))
 
@@ -83,6 +96,7 @@ enum lfs_error {
     LFS_ERR_NOMEM       = -12,  // No more memory available
     LFS_ERR_NOATTR      = -61,  // No data/attr available
     LFS_ERR_NAMETOOLONG = -36,  // File name too long
+    LFS_ERR_NOCONTIG    = -129, // No contiguous run large enough
 };
 
 // File types
@@ -108,6 +122,9 @@ enum lfs_type {
     LFS_TYPE_DIRSTRUCT      = 0x200,
     LFS_TYPE_CTZSTRUCT      = 0x202,
     LFS_TYPE_INLINESTRUCT   = 0x201,
+    // littlefs2e: a contiguous, immutable run of raw blocks. The file's data
+    // tag is the extent itself; there is no CTZ skip-list or inline data.
+    LFS_TYPE_EXTSTRUCT      = 0x203,
     LFS_TYPE_SOFTTAIL       = 0x600,
     LFS_TYPE_HARDTAIL       = 0x601,
     LFS_TYPE_MOVESTATE      = 0x7ff,
@@ -144,6 +161,7 @@ enum lfs_open_flags {
     LFS_F_ERRED   = 0x00100000, // An error occurred during write
 #endif
     LFS_F_INLINE  = 0x01000000, // Currently inlined in directory entry
+    LFS_F_EXT     = 0x02000000, // File data is a contiguous extent
 };
 
 // File seek flags
@@ -397,6 +415,18 @@ typedef struct lfs_dir {
     lfs_block_t head[2];
 } lfs_dir_t;
 
+// littlefs2e extent: a single contiguous run of blocks holding file bytes
+// verbatim. `head` is block-aligned to the creator's alignment request (16
+// blocks for a 64 KiB XIP mapping), `count` is the padded run length, and
+// `length` is the real payload size. `crc` is optional (0 means "not set").
+typedef struct lfs_ext {
+    lfs_block_t head;
+    lfs_block_t count;
+    lfs_size_t length;
+    uint32_t crc;
+    uint32_t flags;
+} lfs_ext_t;
+
 // littlefs file type
 typedef struct lfs_file {
     struct lfs_file *next;
@@ -408,6 +438,8 @@ typedef struct lfs_file {
         lfs_block_t head;
         lfs_size_t size;
     } ctz;
+
+    lfs_ext_t ext;
 
     uint32_t flags;
     lfs_off_t pos;
@@ -464,6 +496,13 @@ typedef struct lfs {
     lfs_size_t file_max;
     lfs_size_t attr_max;
     lfs_size_t inline_max;
+    // Blocks reserved for an in-flight extent creation or defrag window.
+    // Consulted by the allocator until the extent tag is committed.
+    uint8_t *ext_bitmap;
+    uint8_t ext_map[LFS_EXT_MAP_MAX];
+    lfs_block_t ext_head;
+    lfs_block_t ext_count;
+    lfs_size_t ext_length;
 
 #ifdef LFS_MIGRATE
     struct lfs1 *lfs1;
@@ -793,6 +832,122 @@ int lfs_fs_grow(lfs_t *lfs, lfs_size_t block_count);
 int lfs_migrate(lfs_t *lfs, const struct lfs_config *cfg);
 #endif
 #endif
+
+
+/// Extent files (littlefs2e) ///
+
+#ifndef LFS_READONLY
+// Reserve a contiguous, aligned run of blocks for a new extent. The run is
+// kept out of the allocator until lfs_ext_commit() or lfs_ext_abort().
+// `align` is in blocks (1 for no alignment, 16 for a 64 KiB XIP window with
+// 4 KiB blocks). The run is erased. On success `out` receives head/count/
+// length; crc/flags are the caller's to fill in for lfs_ext_commit().
+//
+// Returns a negative error code on failure (LFS_ERR_NOCONTIG when the
+// filesystem has free blocks but no run of the requested size/alignment).
+int lfs_ext_reserve(lfs_t *lfs, lfs_size_t length, lfs_block_t align,
+        lfs_ext_t *out);
+
+// Write bytes into the reserved run at `offset`.
+int lfs_ext_write(lfs_t *lfs, lfs_size_t offset,
+        const void *buffer, lfs_size_t size);
+
+// Sync the payload, raise the on-disk version to littlefs2e if needed, and
+// commit `path` as an extent file, replacing any existing file data tag.
+// Metadata is committed atomically; old data blocks become free.
+int lfs_ext_commit(lfs_t *lfs, const char *path, uint32_t crc);
+
+// Drop a reservation. The run is unreferenced and will be reused.
+void lfs_ext_abort(lfs_t *lfs);
+#endif
+
+// Read the extent descriptor of `path`. Returns LFS_ERR_NOENT if the path is
+// not a regular extent file (including an ordinary file).
+int lfs_ext_info(lfs_t *lfs, const char *path, lfs_ext_t *out);
+
+// Largest free run in blocks, optionally requiring `align`-block alignment.
+lfs_block_t lfs_ext_largest_run(lfs_t *lfs, lfs_block_t align);
+
+// Fill `used` and `meta` bitmaps (block_count bits each, caller-sized at
+// (block_count+7)/8) for defrag planning. `meta` marks directory pairs
+// (including split-directory tails). Extents count as used.
+int lfs_ext_block_maps(lfs_t *lfs,
+        uint8_t *used, lfs_size_t used_size,
+        uint8_t *meta, lfs_size_t meta_size);
+
+// Mark every block of `path` via `cb`. Inline files and directories call
+// nothing. Extent files yield their whole run.
+int lfs_ext_file_blocks(lfs_t *lfs, const char *path,
+        int (*cb)(void*, lfs_block_t), void *data);
+
+// Enumerate every directory metadata pair, calling cb(data, pair, tail): once
+// for the directory's head pair and once per pair of a split-directory tail
+// chain (`tail` is true for those).
+int lfs_ext_dir_pairs(lfs_t *lfs,
+        int (*cb)(void*, const lfs_block_t[2], bool), void *data);
+
+#ifndef LFS_READONLY
+// Relocate the directory whose metadata pair is `pair`: commit a compacted
+// copy to a fresh pair, repoint the parent, then unlink the old pair. Refuses
+// the root pair with LFS_ERR_INVAL. One call moves one half of the pair;
+// while an allocation exclusion is active it repeats until both blocks are
+// outside it (LFS_ERR_NOSPC when that is not possible). The root pair's tail
+// can move, but a split directory's tail pair cannot be targeted directly.
+int lfs_ext_relocate_dir(lfs_t *lfs, lfs_block_t pair[2]);
+
+// Move every movable occupant out of [head, head+count): first relocate the
+// directories whose pairs intersect it, then copy ordinary files to a
+// temporary name and rename them back, with the window excluded from
+// allocation. `budget_blocks` caps the blocks moved (0 = no cap).
+//
+// Extent blocks, open files and split-directory tail pairs pin a window, so
+// it returns LFS_ERR_NOSPC for those rather than risk the payload or a live
+// handle. A failure part way through leaves a consistent filesystem and a
+// partially cleared window.
+int lfs_ext_clear_window(lfs_t *lfs, lfs_block_t head,
+        lfs_block_t count, lfs_size_t budget_blocks);
+
+// Defragment until a run of `length` bytes starting on an `align`-block
+// boundary is free, and reserve it exactly as lfs_ext_reserve() would.
+// Candidate windows are tried best-first. Returns LFS_ERR_NOSPC when no
+// window can be cleared.
+int lfs_ext_defrag(lfs_t *lfs, lfs_size_t length, lfs_block_t align,
+        lfs_size_t budget_blocks, lfs_ext_t *out);
+
+// The same operation in steps, so a caller that must keep a UI alive can
+// yield between them. One step is a directory fetch, a single entry of the
+// scan, one relocated pair, one moved file or eight erased blocks.
+//
+// Only one defragmenter may run at a time; a second begin returns
+// LFS_ERR_INVAL, as does a begin while a reservation is in flight.
+enum {
+    LFS_EXT_PHASE_SPACE = 0,
+    LFS_EXT_PHASE_MOVE  = 1,
+    LFS_EXT_PHASE_ERASE = 2,
+};
+
+int lfs_ext_defrag_begin(lfs_t *lfs, lfs_size_t length,
+        lfs_block_t align, lfs_size_t budget_blocks);
+// 1 = more to do, 0 = the run is reserved, negative = error (which also ends
+// the operation). phase/percent are best-effort progress and may be NULL.
+int lfs_ext_defrag_step(lfs_t *lfs, uint8_t *phase, uint8_t *percent);
+int lfs_ext_defrag_result(lfs_t *lfs, lfs_ext_t *out);
+void lfs_ext_defrag_abort(lfs_t *lfs);
+#endif
+
+#ifndef LFS_READONLY
+// Exclude [head, head+count) from allocation while defrag moves files.
+// Only one range may be active at a time.
+int lfs_ext_exclude(lfs_t *lfs, lfs_block_t head, lfs_block_t count);
+void lfs_ext_clear_exclude(lfs_t *lfs);
+#endif
+
+// Number of blocks, useful for sizing the maps above.
+lfs_size_t lfs_fs_block_count(lfs_t *lfs);
+
+// On-disk version this mount reports. A current image is 2.1; an image
+// mounted at an older minor reports that until its superblock is rewritten.
+uint32_t lfs_fs_disk_version(lfs_t *lfs);
 
 
 #ifdef __cplusplus

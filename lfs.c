@@ -484,6 +484,35 @@ static void lfs_ctz_tole32(struct lfs_ctz *ctz) {
 }
 #endif
 
+// littlefs2e extent descriptor
+static void lfs_ext_fromle32(lfs_ext_t *ext) {
+    ext->head = lfs_fromle32(ext->head);
+    ext->count = lfs_fromle32(ext->count);
+    ext->length = lfs_fromle32(ext->length);
+    ext->crc = lfs_fromle32(ext->crc);
+    ext->flags = lfs_fromle32(ext->flags);
+}
+
+#ifndef LFS_READONLY
+static void lfs_ext_tole32(lfs_ext_t *ext) {
+    ext->head = lfs_tole32(ext->head);
+    ext->count = lfs_tole32(ext->count);
+    ext->length = lfs_tole32(ext->length);
+    ext->crc = lfs_tole32(ext->crc);
+    ext->flags = lfs_tole32(ext->flags);
+}
+#endif
+
+// Validate a descriptor read from disk. A corrupt tag must never make the
+// allocator or a reader touch a block outside the filesystem.
+static bool lfs_ext_valid(lfs_t *lfs, const lfs_ext_t *ext) {
+    return ext->length > 0
+        && ext->count > 0
+        && ext->head < lfs->block_count
+        && ext->count <= lfs->block_count - ext->head
+        && ext->length <= (lfs_size_t)ext->count * lfs->cfg->block_size;
+}
+
 static inline void lfs_superblock_fromle32(lfs_superblock_t *superblock) {
     superblock->version     = lfs_fromle32(superblock->version);
     superblock->block_size  = lfs_fromle32(superblock->block_size);
@@ -532,7 +561,7 @@ static void lfs_mlist_append(lfs_t *lfs, struct lfs_mlist *mlist) {
 }
 
 // some other filesystem operations
-static uint32_t lfs_fs_disk_version(lfs_t *lfs) {
+uint32_t lfs_fs_disk_version(lfs_t *lfs) {
     (void)lfs;
 #ifdef LFS_MULTIVERSION
     if (lfs->cfg->disk_version) {
@@ -560,7 +589,10 @@ static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
         const struct lfs_mattr *attrs, int attrcount);
 static int lfs_dir_compact(lfs_t *lfs,
         lfs_mdir_t *dir, const struct lfs_mattr *attrs, int attrcount,
-        lfs_mdir_t *source, uint16_t begin, uint16_t end);
+        lfs_mdir_t *source, uint16_t begin, uint16_t end,
+        bool force_relocate);
+static int lfs_dir_propagate_relocation(lfs_t *lfs,
+        lfs_block_t pair[2], lfs_mdir_t *dir, int state);
 static lfs_ssize_t lfs_file_flushedwrite(lfs_t *lfs, lfs_file_t *file,
         const void *buffer, lfs_size_t size);
 static lfs_ssize_t lfs_file_write_(lfs_t *lfs, lfs_file_t *file,
@@ -658,6 +690,22 @@ static int lfs_alloc_scan(lfs_t *lfs) {
         return err;
     }
 
+    // Mark blocks reserved for an in-flight extent/defrag window as used in
+    // this lookahead window too (the tree does not reference them yet).
+    if (lfs->ext_bitmap) {
+        for (lfs_block_t b = lfs->ext_head;
+                b < lfs->ext_head + lfs->ext_count; b++) {
+            if (b >= lfs->block_count) {
+                break;
+            }
+            lfs_block_t off = ((b - lfs->lookahead.start)
+                    + lfs->block_count) % lfs->block_count;
+            if (off < lfs->lookahead.size) {
+                lfs->lookahead.buffer[off / 8] |= 1U << (off % 8);
+            }
+        }
+    }
+
     return 0;
 }
 #endif
@@ -672,6 +720,15 @@ static int lfs_alloc(lfs_t *lfs, lfs_block_t *block) {
                 // found a free block
                 *block = (lfs->lookahead.start + lfs->lookahead.next)
                         % lfs->block_count;
+
+                // A run reserved for an extent/defrag is not in the tree yet.
+                if (lfs->ext_bitmap
+                        && (lfs->ext_bitmap[*block / 8]
+                            & (UINT8_C(1) << (*block % 8)))) {
+                    lfs->lookahead.next += 1;
+                    lfs->lookahead.ckpoint -= 1;
+                    continue;
+                }
 
                 // eagerly find next free block to maximize how many blocks
                 // lfs_alloc_ckpoint makes available for scanning
@@ -1428,6 +1485,21 @@ static int lfs_dir_getinfo(lfs_t *lfs, lfs_mdir_t *dir,
 
     info->type = lfs_tag_type3(tag);
 
+    // littlefs2e extent files carry their size in the extent descriptor.
+    lfs_ext_t ext;
+    lfs_stag_t xtag = lfs_dir_get(lfs, dir, LFS_MKTAG(0x7ff, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_EXTSTRUCT, id, sizeof(ext)), &ext);
+    if (xtag >= 0) {
+        lfs_ext_fromle32(&ext);
+        if (!lfs_ext_valid(lfs, &ext)) {
+            return LFS_ERR_CORRUPT;
+        }
+        info->size = ext.length;
+        return 0;
+    } else if (xtag != LFS_ERR_NOENT) {
+        return (int)xtag;
+    }
+
     struct lfs_ctz ctz;
     tag = lfs_dir_get(lfs, dir, LFS_MKTAG(0x700, 0x3ff, 0),
             LFS_MKTAG(LFS_TYPE_STRUCT, id, sizeof(ctz)), &ctz);
@@ -1893,7 +1965,8 @@ static int lfs_dir_split(lfs_t *lfs,
     tail.tail[1] = dir->tail[1];
 
     // note we don't care about LFS_OK_RELOCATED
-    int res = lfs_dir_compact(lfs, &tail, attrs, attrcount, source, split, end);
+    int res = lfs_dir_compact(lfs, &tail, attrs, attrcount, source,
+            split, end, false);
     if (res < 0) {
         return res;
     }
@@ -1952,10 +2025,11 @@ static bool lfs_dir_needsrelocation(lfs_t *lfs, lfs_mdir_t *dir) {
 #ifndef LFS_READONLY
 static int lfs_dir_compact(lfs_t *lfs,
         lfs_mdir_t *dir, const struct lfs_mattr *attrs, int attrcount,
-        lfs_mdir_t *source, uint16_t begin, uint16_t end) {
+        lfs_mdir_t *source, uint16_t begin, uint16_t end,
+        bool force_relocate) {
     // save some state in case block is bad
     bool relocated = false;
-    bool tired = lfs_dir_needsrelocation(lfs, dir);
+    bool tired = force_relocate || lfs_dir_needsrelocation(lfs, dir);
 
     // increment revision count
     dir->rev += 1;
@@ -2227,7 +2301,8 @@ static int lfs_dir_splittingcompact(lfs_t *lfs, lfs_mdir_t *dir,
         }
     }
 
-    return lfs_dir_compact(lfs, dir, attrs, attrcount, source, begin, end);
+    return lfs_dir_compact(lfs, dir, attrs, attrcount, source, begin, end,
+            false);
 }
 #endif
 
@@ -2406,68 +2481,15 @@ fixmlist:;
 #endif
 
 #ifndef LFS_READONLY
-static int lfs_dir_orphaningcommit(lfs_t *lfs, lfs_mdir_t *dir,
-        const struct lfs_mattr *attrs, int attrcount) {
-    // check for any inline files that aren't RAM backed and
-    // forcefully evict them, needed for filesystem consistency
-    for (lfs_file_t *f = (lfs_file_t*)lfs->mlist; f; f = f->next) {
-        if (dir != &f->m && lfs_pair_cmp(f->m.pair, dir->pair) == 0 &&
-                f->type == LFS_TYPE_REG && (f->flags & LFS_F_INLINE) &&
-                f->ctz.size > lfs->cfg->cache_size) {
-            int err = lfs_file_outline(lfs, f);
-            if (err) {
-                return err;
-            }
-
-            err = lfs_file_flush(lfs, f);
-            if (err) {
-                return err;
-            }
-        }
-    }
-
-    lfs_block_t lpair[2] = {dir->pair[0], dir->pair[1]};
+// Point the parent (and any grandparent that relocates as a result) at the
+// new pair, then unlink the old one. Split out of
+// lfs_dir_orphaningcommit unchanged so the extent defragmenter can relocate
+// a directory it chose with the same bookkeeping.
+static int lfs_dir_propagate_relocation(lfs_t *lfs,
+        lfs_block_t pair[2], lfs_mdir_t *dir, int state) {
+    lfs_block_t lpair[2] = {pair[0], pair[1]};
     lfs_mdir_t ldir = *dir;
     lfs_mdir_t pdir;
-    int state = lfs_dir_relocatingcommit(lfs, &ldir, dir->pair,
-            attrs, attrcount, &pdir);
-    if (state < 0) {
-        return state;
-    }
-
-    // update if we're not in mlist, note we may have already been
-    // updated if we are in mlist
-    if (lfs_pair_cmp(dir->pair, lpair) == 0) {
-        *dir = ldir;
-    }
-
-    // commit was successful, but may require other changes in the
-    // filesystem, these would normally be tail recursive, but we have
-    // flattened them here avoid unbounded stack usage
-
-    // need to drop?
-    if (state == LFS_OK_DROPPED) {
-        // steal state
-        int err = lfs_dir_getgstate(lfs, dir, &lfs->gdelta);
-        if (err) {
-            return err;
-        }
-
-        // steal tail, note that this can't create a recursive drop
-        lpair[0] = pdir.pair[0];
-        lpair[1] = pdir.pair[1];
-        lfs_pair_tole32(dir->tail);
-        state = lfs_dir_relocatingcommit(lfs, &pdir, lpair, LFS_MKATTRS(
-                    {LFS_MKTAG(LFS_TYPE_TAIL + dir->split, 0x3ff, 8),
-                        dir->tail}),
-                NULL);
-        lfs_pair_fromle32(dir->tail);
-        if (state < 0) {
-            return state;
-        }
-
-        ldir = pdir;
-    }
 
     // need to relocate?
     bool orphans = false;
@@ -2595,6 +2617,75 @@ static int lfs_dir_orphaningcommit(lfs_t *lfs, lfs_mdir_t *dir,
     }
 
     return orphans ? LFS_OK_ORPHANED : 0;
+}
+#endif
+
+#ifndef LFS_READONLY
+static int lfs_dir_orphaningcommit(lfs_t *lfs, lfs_mdir_t *dir,
+        const struct lfs_mattr *attrs, int attrcount) {
+    // check for any inline files that aren't RAM backed and
+    // forcefully evict them, needed for filesystem consistency
+    for (lfs_file_t *f = (lfs_file_t*)lfs->mlist; f; f = f->next) {
+        if (dir != &f->m && lfs_pair_cmp(f->m.pair, dir->pair) == 0 &&
+                f->type == LFS_TYPE_REG && (f->flags & LFS_F_INLINE) &&
+                f->ctz.size > lfs->cfg->cache_size) {
+            int err = lfs_file_outline(lfs, f);
+            if (err) {
+                return err;
+            }
+
+            err = lfs_file_flush(lfs, f);
+            if (err) {
+                return err;
+            }
+        }
+    }
+
+    lfs_block_t lpair[2] = {dir->pair[0], dir->pair[1]};
+    lfs_mdir_t ldir = *dir;
+    lfs_mdir_t pdir;
+    int state = lfs_dir_relocatingcommit(lfs, &ldir, dir->pair,
+            attrs, attrcount, &pdir);
+    if (state < 0) {
+        return state;
+    }
+
+    // update if we're not in mlist, note we may have already been
+    // updated if we are in mlist
+    if (lfs_pair_cmp(dir->pair, lpair) == 0) {
+        *dir = ldir;
+    }
+
+    // commit was successful, but may require other changes in the
+    // filesystem, these would normally be tail recursive, but we have
+    // flattened them here avoid unbounded stack usage
+
+    // need to drop?
+    if (state == LFS_OK_DROPPED) {
+        // steal state
+        int err = lfs_dir_getgstate(lfs, dir, &lfs->gdelta);
+        if (err) {
+            return err;
+        }
+
+        // steal tail, note that this can't create a recursive drop
+        lpair[0] = pdir.pair[0];
+        lpair[1] = pdir.pair[1];
+        lfs_pair_tole32(dir->tail);
+        state = lfs_dir_relocatingcommit(lfs, &pdir, lpair, LFS_MKATTRS(
+                    {LFS_MKTAG(LFS_TYPE_TAIL + dir->split, 0x3ff, 8),
+                        dir->tail}),
+                NULL);
+        lfs_pair_fromle32(dir->tail);
+        if (state < 0) {
+            return state;
+        }
+
+        ldir = pdir;
+    }
+
+    // need to relocate?
+    return lfs_dir_propagate_relocation(lfs, lpair, &ldir, state);
 }
 #endif
 
@@ -3143,20 +3234,67 @@ static int lfs_file_opencfg_(lfs_t *lfs, lfs_file_t *file,
         err = LFS_ERR_ISDIR;
         goto cleanup;
 #ifndef LFS_READONLY
-    } else if (flags & LFS_O_TRUNC) {
-        // truncate if requested
+    } else if ((flags & LFS_O_TRUNC)
+            && ((flags & LFS_O_WRONLY) == LFS_O_WRONLY)) {
+        // A normal truncate/write replaces an extent with ordinary file
+        // data. Delete the extent tag first (its blocks become free), then
+        // proceed as an empty inline file.
+        lfs_ext_t ext;
+        lfs_stag_t xtag = lfs_dir_get(lfs, &file->m,
+                LFS_MKTAG(0x7ff, 0x3ff, 0),
+                LFS_MKTAG(LFS_TYPE_EXTSTRUCT, file->id, sizeof(ext)), &ext);
+        if (xtag >= 0) {
+            err = lfs_dir_commit(lfs, &file->m, LFS_MKATTRS(
+                    {LFS_MKTAG(LFS_TYPE_EXTSTRUCT, file->id, 0x3ff),
+                        NULL}));
+            if (err) {
+                goto cleanup;
+            }
+        } else if (xtag != LFS_ERR_NOENT) {
+            err = (int)xtag;
+            goto cleanup;
+        }
         tag = LFS_MKTAG(LFS_TYPE_INLINESTRUCT, file->id, 0);
         file->flags |= LFS_F_DIRTY;
 #endif
     } else {
-        // try to load what's on disk, if it's inlined we'll fix it later
-        tag = lfs_dir_get(lfs, &file->m, LFS_MKTAG(0x700, 0x3ff, 0),
-                LFS_MKTAG(LFS_TYPE_STRUCT, file->id, 8), &file->ctz);
-        if (tag < 0) {
-            err = tag;
+        // littlefs2e: the file data tag may be an extent
+        lfs_ext_t ext;
+        lfs_stag_t xtag = lfs_dir_get(lfs, &file->m,
+                LFS_MKTAG(0x7ff, 0x3ff, 0),
+                LFS_MKTAG(LFS_TYPE_EXTSTRUCT, file->id, sizeof(ext)), &ext);
+        if (xtag >= 0) {
+            lfs_ext_fromle32(&ext);
+            if (!lfs_ext_valid(lfs, &ext)) {
+                err = LFS_ERR_CORRUPT;
+                goto cleanup;
+            }
+#ifndef LFS_READONLY
+            if ((flags & LFS_O_WRONLY) == LFS_O_WRONLY) {
+                // Extent files are immutable; replace them (O_TRUNC/wb)
+                // instead of writing in place.
+                err = LFS_ERR_INVAL;
+                goto cleanup;
+            }
+#endif
+            file->ext = ext;
+            file->ctz.head = ext.head;
+            file->ctz.size = ext.length;
+            file->flags |= LFS_F_EXT;
+            tag = xtag;
+        } else if (xtag != LFS_ERR_NOENT) {
+            err = (int)xtag;
             goto cleanup;
+        } else {
+            // try to load what's on disk, if it's inlined we'll fix it later
+            tag = lfs_dir_get(lfs, &file->m, LFS_MKTAG(0x700, 0x3ff, 0),
+                    LFS_MKTAG(LFS_TYPE_STRUCT, file->id, 8), &file->ctz);
+            if (tag < 0) {
+                err = tag;
+                goto cleanup;
+            }
+            lfs_ctz_fromle32(&file->ctz);
         }
-        lfs_ctz_fromle32(&file->ctz);
     }
 
     // fetch attrs
@@ -3514,7 +3652,12 @@ static lfs_ssize_t lfs_file_flushedread(lfs_t *lfs, lfs_file_t *file,
         // check if we need a new block
         if (!(file->flags & LFS_F_READING) ||
                 file->off == lfs->cfg->block_size) {
-            if (!(file->flags & LFS_F_INLINE)) {
+            if (file->flags & LFS_F_EXT) {
+                // One contiguous run: the block is a direct index.
+                file->block = file->ext.head
+                        + file->pos / lfs->cfg->block_size;
+                file->off = file->pos % lfs->cfg->block_size;
+            } else if (!(file->flags & LFS_F_INLINE)) {
                 int err = lfs_ctz_find(lfs, NULL, &file->cache,
                         file->ctz.head, file->ctz.size,
                         file->pos, &file->block, &file->off);
@@ -3733,6 +3876,7 @@ static lfs_soff_t lfs_file_seek_(lfs_t *lfs, lfs_file_t *file,
     // if we're only reading and our new offset is still in the file's cache
     // we can avoid flushing and needing to reread the data
     if ((file->flags & LFS_F_READING)
+            && !(file->flags & LFS_F_EXT)
             && file->off != lfs->cfg->block_size) {
         int oindex = lfs_ctz_index(lfs, &(lfs_off_t){file->pos});
         lfs_off_t noff = npos;
@@ -4206,6 +4350,10 @@ static int lfs_removeattr_(lfs_t *lfs, const char *path, uint8_t type) {
 static int lfs_init(lfs_t *lfs, const struct lfs_config *cfg) {
     lfs->cfg = cfg;
     lfs->block_count = cfg->block_count;  // May be 0
+    lfs->ext_bitmap = NULL;
+    lfs->ext_head = 0;
+    lfs->ext_count = 0;
+    lfs->ext_length = 0;
     int err = 0;
 
 #ifdef LFS_MULTIVERSION
@@ -4389,6 +4537,8 @@ static int lfs_deinit(lfs_t *lfs) {
     if (!lfs->cfg->lookahead_buffer) {
         lfs_free(lfs->lookahead.buffer);
     }
+
+    lfs->ext_bitmap = NULL;
 
     return 0;
 }
@@ -4743,6 +4893,27 @@ int lfs_fs_traverse_(lfs_t *lfs,
         }
 
         for (uint16_t id = 0; id < dir.count; id++) {
+            // littlefs2e: an extent claims its whole run.
+            lfs_ext_t ext;
+            lfs_stag_t xtag = lfs_dir_get(lfs, &dir,
+                    LFS_MKTAG(0x7ff, 0x3ff, 0),
+                    LFS_MKTAG(LFS_TYPE_EXTSTRUCT, id, sizeof(ext)), &ext);
+            if (xtag >= 0) {
+                lfs_ext_fromle32(&ext);
+                if (!lfs_ext_valid(lfs, &ext)) {
+                    return LFS_ERR_CORRUPT;
+                }
+                for (lfs_block_t b = ext.head; b < ext.head+ext.count; b++) {
+                    int err = cb(data, b);
+                    if (err) {
+                        return err;
+                    }
+                }
+                continue;
+            } else if (xtag != LFS_ERR_NOENT) {
+                return (int)xtag;
+            }
+
             struct lfs_ctz ctz;
             lfs_stag_t tag = lfs_dir_get(lfs, &dir, LFS_MKTAG(0x700, 0x3ff, 0),
                     LFS_MKTAG(LFS_TYPE_STRUCT, id, sizeof(ctz)), &ctz);
@@ -5977,6 +6148,1440 @@ cleanup:
 
 // Public API
 #ifndef LFS_READONLY
+
+/// littlefs2e extent files ///
+
+struct lfs_ext_map {
+    uint8_t *map;
+    lfs_size_t size;
+};
+
+static int lfs_ext_map_cb(void *data, lfs_block_t block) {
+    struct lfs_ext_map *m = data;
+    if (block / 8 < m->size) {
+        m->map[block / 8] |= (uint8_t)(1U << (block % 8));
+    }
+    return 0;
+}
+
+static lfs_size_t lfs_ext_map_size(lfs_t *lfs) {
+    return (lfs->block_count + 7) / 8;
+}
+
+static bool lfs_ext_map_get(const uint8_t *map, lfs_block_t block) {
+    return (map[block / 8] & (uint8_t)(1U << (block % 8))) != 0;
+}
+
+static void lfs_ext_map_set(uint8_t *map, lfs_block_t block) {
+    map[block / 8] |= (uint8_t)(1U << (block % 8));
+}
+
+// Mark this directory's metadata pair and every pair in its tail chain.
+static void lfs_ext_mark_pairs(lfs_t *lfs, const lfs_block_t pair[2],
+        uint8_t *meta, lfs_size_t meta_size) {
+    lfs_block_t p[2] = {pair[0], pair[1]};
+    int guard = 0;
+    while (!lfs_pair_isnull(p) && guard++ < 128) {
+        if (p[0] / 8 < meta_size) {
+            lfs_ext_map_set(meta, p[0]);
+        }
+        if (p[1] / 8 < meta_size) {
+            lfs_ext_map_set(meta, p[1]);
+        }
+        lfs_mdir_t m;
+        if (lfs_dir_fetch(lfs, &m, p) || !m.split) {
+            // A soft tail (deorphan pred pointer) is not a tail chain.
+            break;
+        }
+        p[0] = m.tail[0];
+        p[1] = m.tail[1];
+    }
+}
+
+static int lfs_ext_walk_meta(lfs_t *lfs, const char *path, int depth,
+        uint8_t *meta, lfs_size_t meta_size) {
+    if (depth > 8) {
+        return LFS_ERR_INVAL;
+    }
+
+    lfs_dir_t dir;
+    int err = lfs_dir_open(lfs, &dir, path);
+    if (err) {
+        return err;
+    }
+    lfs_ext_mark_pairs(lfs, dir.m.pair, meta, meta_size);
+
+    struct lfs_info info;
+    while ((err = lfs_dir_read(lfs, &dir, &info)) > 0) {
+        if (info.type != LFS_TYPE_DIR) {
+            continue;
+        }
+        if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
+            continue;
+        }
+        char child[LFS_NAME_MAX+2];
+        lfs_size_t plen = strlen(path);
+        lfs_size_t nlen = strlen(info.name);
+        bool slash = strcmp(path, "/") != 0;
+        if (plen + (slash ? 1 : 0) + nlen + 1 > sizeof(child)) {
+            lfs_dir_close(lfs, &dir);
+            return LFS_ERR_NAMETOOLONG;
+        }
+        memcpy(child, path, plen);
+        lfs_size_t o = plen;
+        if (slash) {
+            child[o++] = '/';
+        }
+        memcpy(child + o, info.name, nlen);
+        child[o + nlen] = '\0';
+        int r = lfs_ext_walk_meta(lfs, child, depth+1, meta, meta_size);
+        if (r) {
+            lfs_dir_close(lfs, &dir);
+            return r;
+        }
+    }
+    lfs_dir_close(lfs, &dir);
+    return (err < 0) ? err : 0;
+}
+
+int lfs_ext_block_maps(lfs_t *lfs,
+        uint8_t *used, lfs_size_t used_size,
+        uint8_t *meta, lfs_size_t meta_size) {
+    lfs_size_t need = lfs_ext_map_size(lfs);
+    if (used && used_size < need) {
+        return LFS_ERR_INVAL;
+    }
+    if (meta && meta_size < need) {
+        return LFS_ERR_INVAL;
+    }
+    if (used) {
+        memset(used, 0, need);
+        struct lfs_ext_map m = {used, need};
+        int err = lfs_fs_traverse_(lfs, lfs_ext_map_cb, &m, true);
+        if (err) {
+            return err;
+        }
+    }
+    if (meta) {
+        memset(meta, 0, need);
+        int err = lfs_ext_walk_meta(lfs, "/", 0, meta, need);
+        if (err) {
+            return err;
+        }
+    }
+    return 0;
+}
+
+// A block reserved for an extent or a defrag window is not in the tree yet.
+static bool lfs_ext_block_excluded(const lfs_t *lfs, lfs_block_t block) {
+    return lfs->ext_bitmap
+            && (lfs->ext_bitmap[block / 8]
+                & (uint8_t)(1U << (block % 8)));
+}
+
+static int lfs_ext_dir_pairs_walk(lfs_t *lfs, const char *path, int depth,
+        int (*cb)(void*, const lfs_block_t[2], bool), void *data) {
+    if (depth > 8) {
+        return LFS_ERR_INVAL;
+    }
+
+    lfs_dir_t dir;
+    int err = lfs_dir_open(lfs, &dir, path);
+    if (err) {
+        return err;
+    }
+
+    // Head pair first, then every pair of the split tail chain.
+    lfs_block_t pair[2] = {dir.m.pair[0], dir.m.pair[1]};
+    for (int tail = 0; !lfs_pair_isnull(pair) && tail < 128; tail++) {
+        int res = cb(data, pair, tail > 0);
+        if (res) {
+            lfs_dir_close(lfs, &dir);
+            return res;
+        }
+        lfs_mdir_t m;
+        if (lfs_dir_fetch(lfs, &m, pair) || !m.split) {
+            // A soft tail (deorphan pred pointer) is not a tail chain.
+            break;
+        }
+        pair[0] = m.tail[0];
+        pair[1] = m.tail[1];
+    }
+
+    struct lfs_info info;
+    while ((err = lfs_dir_read(lfs, &dir, &info)) > 0) {
+        if (info.type != LFS_TYPE_DIR) {
+            continue;
+        }
+        if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
+            continue;
+        }
+        char child[LFS_NAME_MAX+2];
+        lfs_size_t plen = strlen(path);
+        lfs_size_t nlen = strlen(info.name);
+        bool slash = strcmp(path, "/") != 0;
+        if (plen + (slash ? 1 : 0) + nlen + 1 > sizeof(child)) {
+            lfs_dir_close(lfs, &dir);
+            return LFS_ERR_NAMETOOLONG;
+        }
+        memcpy(child, path, plen);
+        lfs_size_t o = plen;
+        if (slash) {
+            child[o++] = '/';
+        }
+        memcpy(child + o, info.name, nlen);
+        child[o + nlen] = '\0';
+        int r = lfs_ext_dir_pairs_walk(lfs, child, depth+1, cb, data);
+        if (r) {
+            lfs_dir_close(lfs, &dir);
+            return r;
+        }
+    }
+    lfs_dir_close(lfs, &dir);
+    return (err < 0) ? err : 0;
+}
+
+int lfs_ext_dir_pairs(lfs_t *lfs,
+        int (*cb)(void*, const lfs_block_t[2], bool), void *data) {
+    if (!cb) {
+        return LFS_ERR_INVAL;
+    }
+    return lfs_ext_dir_pairs_walk(lfs, "/", 0, cb, data);
+}
+
+#ifndef LFS_READONLY
+int lfs_ext_relocate_dir(lfs_t *lfs, lfs_block_t pair[2]) {
+    if (lfs_pair_isnull(pair)
+            || lfs_pair_cmp(pair, (const lfs_block_t[2]){0, 1}) == 0) {
+        return LFS_ERR_INVAL;
+    }
+
+    lfs_mdir_t dir;
+    int err = lfs_dir_fetch(lfs, &dir, pair);
+    if (err) {
+        return err;
+    }
+
+    // An inline file whose data exceeds the cache is not RAM backed; littlefs
+    // evicts those before compacting a pair (lfs_dir_orphaningcommit does the
+    // same for the same reason). The eviction commits may move the pair, and
+    // an open file's mdir is fixed up by them, so take the pair from there.
+    lfs_block_t cur[2] = {pair[0], pair[1]};
+    lfs_file_t *evicted = NULL;
+    for (lfs_file_t *f = (lfs_file_t*)lfs->mlist; f; f = f->next) {
+        if (f->type == LFS_TYPE_REG
+                && lfs_pair_cmp(f->m.pair, dir.pair) == 0
+                && (f->flags & LFS_F_INLINE)
+                && f->ctz.size > lfs->cfg->cache_size) {
+            err = lfs_file_outline(lfs, f);
+            if (err) {
+                return err;
+            }
+            err = lfs_file_flush(lfs, f);
+            if (err) {
+                return err;
+            }
+            evicted = f;
+        }
+    }
+    if (evicted) {
+        cur[0] = evicted->m.pair[0];
+        cur[1] = evicted->m.pair[1];
+    }
+    err = lfs_dir_fetch(lfs, &dir, cur);
+    if (err) {
+        return err;
+    }
+
+    // A compaction moves only one half of the pair ({a,b} becomes {c,a}), so a
+    // pair that still has a block inside the excluded window needs a second
+    // pass. With no exclusion active one pass is always enough.
+    for (int pass = 0; pass < 3; pass++) {
+        lfs_block_t lpair[2] = {dir.pair[0], dir.pair[1]};
+        lfs_mdir_t ldir = dir;
+        uint16_t end = ldir.count;
+        int state = lfs_dir_compact(lfs, &ldir, NULL, 0, &ldir,
+                0, end, true);
+        if (state < 0) {
+            return state;
+        }
+        if (state != LFS_OK_RELOCATED) {
+            return 0;
+        }
+
+        lfs_block_t newpair[2] = {ldir.pair[0], ldir.pair[1]};
+        if ((newpair[0] == lpair[0] || newpair[0] == lpair[1])
+                && (newpair[1] == lpair[0] || newpair[1] == lpair[1])) {
+            // No room for a new metadata block: the compaction happened in
+            // place, which cannot clear the window.
+            return LFS_ERR_NOSPC;
+        }
+
+        int res = lfs_dir_propagate_relocation(lfs, lpair, &ldir, state);
+        if (res < 0) {
+            return res;
+        }
+        if (res == LFS_OK_ORPHANED) {
+            err = lfs_fs_deorphan(lfs, false);
+            if (err) {
+                return err;
+            }
+        }
+
+        if (!lfs_ext_block_excluded(lfs, newpair[0])
+                && !lfs_ext_block_excluded(lfs, newpair[1])) {
+            return 0;
+        }
+        err = lfs_dir_fetch(lfs, &dir, newpair);
+        if (err) {
+            return err;
+        }
+    }
+    return LFS_ERR_NOSPC;
+}
+#endif
+
+lfs_block_t lfs_ext_largest_run(lfs_t *lfs, lfs_block_t align) {
+    if (align == 0) {
+        align = 1;
+    }
+    lfs_size_t size = lfs_ext_map_size(lfs);
+    if (size > LFS_EXT_MAP_MAX) {
+        return 0;
+    }
+    uint8_t used[LFS_EXT_MAP_MAX];
+    memset(used, 0, size);
+    struct lfs_ext_map m = {used, size};
+    lfs_block_t best = 0;
+    if (lfs_fs_traverse_(lfs, lfs_ext_map_cb, &m, true) == 0) {
+        for (lfs_block_t i = 0; i < lfs->block_count; i += align) {
+            lfs_block_t run = 0;
+            while (i+run < lfs->block_count
+                    && !lfs_ext_map_get(used, i+run)) {
+                run++;
+            }
+            if (run > best) {
+                best = run;
+            }
+            if (i + run >= lfs->block_count) {
+                break;
+            }
+        }
+    }
+    return best;
+}
+
+int lfs_ext_file_blocks(lfs_t *lfs, const char *path,
+        int (*cb)(void*, lfs_block_t), void *data) {
+    lfs_mdir_t cwd;
+    uint16_t id;
+    lfs_stag_t tag = lfs_dir_find(lfs, &cwd, &path, &id);
+    if (tag < 0) {
+        return (int)tag;
+    }
+    if (lfs_tag_type3(tag) != LFS_TYPE_REG) {
+        return LFS_ERR_ISDIR;
+    }
+
+    lfs_ext_t ext;
+    lfs_stag_t xtag = lfs_dir_get(lfs, &cwd, LFS_MKTAG(0x7ff, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_EXTSTRUCT, id, sizeof(ext)), &ext);
+    if (xtag >= 0) {
+        lfs_ext_fromle32(&ext);
+        if (!lfs_ext_valid(lfs, &ext)) {
+            return LFS_ERR_CORRUPT;
+        }
+        for (lfs_block_t b = ext.head; b < ext.head+ext.count; b++) {
+            int err = cb(data, b);
+            if (err) {
+                return err;
+            }
+        }
+        return 0;
+    } else if (xtag != LFS_ERR_NOENT) {
+        return (int)xtag;
+    }
+
+    struct lfs_ctz ctz;
+    lfs_stag_t t = lfs_dir_get(lfs, &cwd, LFS_MKTAG(0x700, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_STRUCT, id, sizeof(ctz)), &ctz);
+    if (t < 0) {
+        if (t == LFS_ERR_NOENT) {
+            return 0;
+        }
+        return (int)t;
+    }
+    lfs_ctz_fromle32(&ctz);
+    if (lfs_tag_type3(t) == LFS_TYPE_CTZSTRUCT) {
+        return lfs_ctz_traverse(lfs, NULL, &lfs->rcache,
+                ctz.head, ctz.size, cb, data);
+    }
+    return 0;
+}
+
+#ifndef LFS_READONLY
+int lfs_ext_exclude(lfs_t *lfs, lfs_block_t head, lfs_block_t count) {
+    if (head >= lfs->block_count
+            || count > lfs->block_count - head) {
+        return LFS_ERR_INVAL;
+    }
+    lfs_size_t size = lfs_ext_map_size(lfs);
+    if (size > LFS_EXT_MAP_MAX) {
+        return LFS_ERR_NOMEM;
+    }
+    memset(lfs->ext_map, 0, size);
+    lfs->ext_bitmap = lfs->ext_map;
+    lfs->ext_head = head;
+    lfs->ext_count = count;
+    for (lfs_block_t b = head; b < head+count; b++) {
+        lfs_ext_map_set(lfs->ext_bitmap, b);
+    }
+    return 0;
+}
+
+void lfs_ext_clear_exclude(lfs_t *lfs) {
+    lfs->ext_bitmap = NULL;
+    lfs->ext_head = 0;
+    lfs->ext_count = 0;
+    lfs->ext_length = 0;
+}
+
+int lfs_ext_reserve(lfs_t *lfs, lfs_size_t length, lfs_block_t align,
+        lfs_ext_t *out) {
+    if (!out || length == 0) {
+        return LFS_ERR_INVAL;
+    }
+    if (align == 0) {
+        align = 1;
+    }
+    lfs_size_t bs = lfs->cfg->block_size;
+    lfs_block_t count = (length + bs - 1) / bs;
+    if (count == 0 || count > lfs->block_count) {
+        return LFS_ERR_NOSPC;
+    }
+
+    // Drop any previous reservation/exclusion.
+    lfs_ext_clear_exclude(lfs);
+
+    lfs_size_t size = lfs_ext_map_size(lfs);
+    if (size > LFS_EXT_MAP_MAX) {
+        return LFS_ERR_NOMEM;
+    }
+    uint8_t used[LFS_EXT_MAP_MAX];
+    memset(used, 0, size);
+    struct lfs_ext_map m = {used, size};
+    int err = lfs_fs_traverse_(lfs, lfs_ext_map_cb, &m, true);
+    if (err) {
+        return err;
+    }
+    uint8_t *reserved = lfs->ext_map;
+    memset(reserved, 0, size);
+
+    lfs_block_t head = 0;
+    bool found = false;
+    for (int attempt = 0; attempt < 16 && !found; attempt++) {
+        head = 0;
+        while (head + count <= lfs->block_count) {
+            if (head % align != 0) {
+                head += align - (head % align);
+                continue;
+            }
+            lfs_block_t i;
+            for (i = 0; i < count; i++) {
+                if (lfs_ext_map_get(used, head+i)
+                        || lfs_ext_map_get(reserved, head+i)) {
+                    break;
+                }
+            }
+            if (i == count) {
+                break;
+            }
+            head += align;
+        }
+        if (head + count > lfs->block_count) {
+            break;
+        }
+
+        // Erase the candidate. A bad block disqualifies it; try the next run.
+        bool bad = false;
+        for (lfs_block_t i = 0; i < count; i++) {
+            err = lfs_bd_erase(lfs, head+i);
+            if (err) {
+                if (err == LFS_ERR_CORRUPT) {
+                    lfs_ext_map_set(used, head+i);
+                    bad = true;
+                    break;
+                }
+                return err;
+            }
+        }
+        if (bad) {
+            // Skip past the bad block and search again.
+            for (lfs_block_t i = 0; i < count; i++) {
+                if (lfs_ext_map_get(used, head+i)) {
+                    head = head+i+1;
+                    break;
+                }
+            }
+            continue;
+        }
+        found = true;
+    }
+
+    if (!found) {
+        return LFS_ERR_NOCONTIG;
+    }
+
+    for (lfs_block_t b = head; b < head+count; b++) {
+        lfs_ext_map_set(reserved, b);
+    }
+    lfs->ext_bitmap = reserved;
+    lfs->ext_head = head;
+    lfs->ext_count = count;
+    lfs->ext_length = length;
+    out->head = head;
+    out->count = count;
+    out->length = length;
+    out->crc = 0;
+    out->flags = 0;
+    return 0;
+}
+
+int lfs_ext_write(lfs_t *lfs, lfs_size_t offset,
+        const void *buffer, lfs_size_t size) {
+    if (!lfs->ext_bitmap || lfs->ext_count == 0) {
+        return LFS_ERR_INVAL;
+    }
+    lfs_size_t bs = lfs->cfg->block_size;
+    if (offset > (lfs_size_t)lfs->ext_count * bs
+            || size > (lfs_size_t)lfs->ext_count * bs - offset) {
+        return LFS_ERR_INVAL;
+    }
+    const uint8_t *data = buffer;
+    while (size > 0) {
+        lfs_block_t block = lfs->ext_head + offset / bs;
+        lfs_off_t off = offset % bs;
+        lfs_size_t n = lfs_min(size, bs - (lfs_size_t)off);
+        int err = lfs_bd_prog(lfs, &lfs->pcache, &lfs->rcache, true,
+                block, off, data, n);
+        if (err) {
+            return err;
+        }
+        data += n;
+        offset += n;
+        size -= n;
+    }
+    return 0;
+}
+
+int lfs_ext_commit(lfs_t *lfs, const char *path, uint32_t crc) {
+    if (!lfs->ext_bitmap || lfs->ext_count == 0) {
+        return LFS_ERR_INVAL;
+    }
+
+    int err = lfs_bd_sync(lfs, &lfs->pcache, &lfs->rcache, false);
+    if (err) {
+        lfs_ext_clear_exclude(lfs);
+        return err;
+    }
+
+    lfs_ext_t ext;
+    ext.head = lfs->ext_head;
+    ext.count = lfs->ext_count;
+    ext.length = lfs->ext_length;
+    ext.crc = crc;
+    ext.flags = 0;
+
+    lfs_mdir_t cwd;
+    uint16_t id;
+    lfs_stag_t tag = lfs_dir_find(lfs, &cwd, &path, &id);
+    if (tag < 0 && tag != LFS_ERR_NOENT) {
+        lfs_ext_clear_exclude(lfs);
+        return (int)tag;
+    }
+
+    if (tag >= 0) {
+        if (lfs_tag_type3(tag) != LFS_TYPE_REG) {
+            lfs_ext_clear_exclude(lfs);
+            return LFS_ERR_ISDIR;
+        }
+        // Find the data tag this commit replaces (CTZ, inline or extent).
+        struct lfs_ctz ctz;
+        lfs_stag_t old = lfs_dir_get(lfs, &cwd,
+                LFS_MKTAG(0x700, 0x3ff, 0),
+                LFS_MKTAG(LFS_TYPE_STRUCT, id, sizeof(ctz)), &ctz);
+        if (old < 0 && old != LFS_ERR_NOENT) {
+            lfs_ext_clear_exclude(lfs);
+            return (int)old;
+        }
+        uint16_t oldtype = (old >= 0)
+                ? lfs_tag_type3(old) : LFS_TYPE_INLINESTRUCT;
+        lfs_ext_tole32(&ext);
+        err = lfs_dir_commit(lfs, &cwd, LFS_MKATTRS(
+                {LFS_MKTAG(oldtype, id, 0x3ff), NULL},
+                {LFS_MKTAG(LFS_TYPE_EXTSTRUCT, id, sizeof(ext)), &ext}));
+    } else {
+        lfs_size_t nlen = lfs_path_namelen(path);
+        if (nlen > lfs->name_max) {
+            lfs_ext_clear_exclude(lfs);
+            return LFS_ERR_NAMETOOLONG;
+        }
+        lfs_ext_tole32(&ext);
+        err = lfs_dir_commit(lfs, &cwd, LFS_MKATTRS(
+                {LFS_MKTAG(LFS_TYPE_CREATE, id, 0), NULL},
+                {LFS_MKTAG(LFS_TYPE_REG, id, nlen), path},
+                {LFS_MKTAG(LFS_TYPE_EXTSTRUCT, id, sizeof(ext)), &ext}));
+    }
+
+    lfs_ext_clear_exclude(lfs);
+    return err;
+}
+
+void lfs_ext_abort(lfs_t *lfs) {
+    lfs_ext_clear_exclude(lfs);
+}
+#endif
+
+int lfs_ext_info(lfs_t *lfs, const char *path, lfs_ext_t *out) {
+    lfs_mdir_t cwd;
+    uint16_t id;
+    lfs_stag_t tag = lfs_dir_find(lfs, &cwd, &path, &id);
+    if (tag < 0) {
+        return (int)tag;
+    }
+    if (lfs_tag_type3(tag) != LFS_TYPE_REG) {
+        return LFS_ERR_ISDIR;
+    }
+    lfs_ext_t ext;
+    lfs_stag_t xtag = lfs_dir_get(lfs, &cwd, LFS_MKTAG(0x7ff, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_EXTSTRUCT, id, sizeof(ext)), &ext);
+    if (xtag < 0) {
+        return (int)xtag;
+    }
+    lfs_ext_fromle32(&ext);
+    if (!lfs_ext_valid(lfs, &ext)) {
+        return LFS_ERR_CORRUPT;
+    }
+    if (out) {
+        *out = ext;
+    }
+    return 0;
+}
+
+/// littlefs2e defragmenter ///
+#ifndef LFS_READONLY
+
+// A window can only become an extent if it holds no live block at all, so the
+// directories intersecting it are relocated before the ordinary files are
+// moved out. Split-directory tail pairs cannot be relocated on their own: a
+// child is found through its DIRSTRUCT entry, while a tail is referenced by a
+// TAIL tag in the head pair (lfs_fs_parent matches DIRSTRUCT only), so a tail
+// pair inside a window pins that window. Lifting that needs either a rewrite
+// of the head's TAIL tag to a fresh tail pair or a rebuild of the whole head
+// and tail chain into new pairs; a directory whose *head* is in the window
+// relocates normally.
+
+#define LFS_EXT_DEFRAG_ATTEMPTS 8
+#define LFS_EXT_MAX_PAIRS 32
+// Keep the scan's per-frame and per-window footprint small: a filesystem read
+// reaches the block device through a Python callback, which needs its own VM
+// stack, so a few kilobytes here can overflow the MicroPython task stack.
+#define LFS_EXT_MAX_OCCUPANTS 8
+#define LFS_EXT_MAX_PATH 96
+#define LFS_EXT_MAX_DEPTH 6
+#define LFS_EXT_CACHE_MAX 4096
+
+struct lfs_ext_block_check {
+    lfs_block_t head;
+    lfs_block_t count;
+    lfs_block_t blocks;
+    bool hit;
+};
+
+struct lfs_ext_occupant {
+    char path[LFS_EXT_MAX_PATH];
+    lfs_size_t size;
+    lfs_block_t blocks;
+};
+
+struct lfs_ext_window {
+    lfs_block_t head;
+    lfs_block_t count;
+    lfs_block_t pairs[LFS_EXT_MAX_PAIRS][2];
+    int pair_count;
+    struct lfs_ext_occupant files[LFS_EXT_MAX_OCCUPANTS];
+    int file_count;
+    lfs_block_t moved_blocks;
+    lfs_block_t max_file_blocks;
+    struct lfs_info info;
+    bool reject;
+};
+
+static bool lfs_ext_in_window(lfs_block_t block,
+        lfs_block_t head, lfs_block_t count) {
+    return block >= head && block < head + count;
+}
+
+static int lfs_ext_block_check_cb(void *data, lfs_block_t block) {
+    struct lfs_ext_block_check *check = data;
+    check->blocks += 1;
+    if (lfs_ext_in_window(block, check->head, check->count)) {
+        check->hit = true;
+    }
+    return 0;
+}
+
+static int lfs_ext_used_into(lfs_t *lfs, uint8_t *map) {
+    lfs_size_t size = lfs_ext_map_size(lfs);
+    memset(map, 0, size);
+    struct lfs_ext_map m = {map, size};
+    return lfs_fs_traverse_(lfs, lfs_ext_map_cb, &m, true);
+}
+
+// Reject a window that an open file still holds data blocks in: the caller's
+// handle would keep reading the old blocks after the copy frees them.
+static bool lfs_ext_open_hits(lfs_t *lfs,
+        lfs_block_t head, lfs_block_t count) {
+    for (struct lfs_mlist *d = lfs->mlist; d; d = d->next) {
+        lfs_file_t *file = (lfs_file_t*)d;
+        if (file->type != LFS_TYPE_REG || (file->flags & LFS_F_INLINE)) {
+            continue;
+        }
+        struct lfs_ext_block_check check = {head, count, 0, false};
+        if (file->ctz.size && lfs_ctz_traverse(lfs,
+                &file->cache, &lfs->rcache,
+                file->ctz.head, file->ctz.size,
+                lfs_ext_block_check_cb, &check)) {
+            return true;
+        }
+        if ((file->flags & LFS_F_WRITING) && file->pos && lfs_ctz_traverse(
+                lfs, &file->cache, &lfs->rcache,
+                file->block, file->pos,
+                lfs_ext_block_check_cb, &check)) {
+            return true;
+        }
+        if (check.hit) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Record a head pair that must be relocated, or reject the window for a tail
+// pair (which cannot move on its own).
+static int lfs_ext_scan_pair(const lfs_block_t pair[2],
+        struct lfs_ext_window *w) {
+    if (lfs_ext_in_window(pair[0], w->head, w->count)
+            || lfs_ext_in_window(pair[1], w->head, w->count)) {
+        if (w->pair_count >= LFS_EXT_MAX_PAIRS) {
+            w->reject = true;
+            return 0;
+        }
+        w->pairs[w->pair_count][0] = pair[0];
+        w->pairs[w->pair_count][1] = pair[1];
+        w->pair_count += 1;
+    }
+    return 0;
+}
+
+static int lfs_ext_move_file(lfs_t *lfs, const char *path,
+        uint8_t *inbuf, uint8_t *outbuf, uint8_t *copy) {
+    char tmp[LFS_EXT_MAX_PATH+4];
+    lfs_size_t plen = strlen(path);
+    if (plen + 4 > sizeof(tmp)) {
+        return LFS_ERR_NAMETOOLONG;
+    }
+    memcpy(tmp, path, plen);
+    memcpy(tmp + plen, ".dfg", 5);
+
+    int err = lfs_remove(lfs, tmp);
+    if (err && err != LFS_ERR_NOENT) {
+        return err;
+    }
+
+    struct lfs_file_config incfg = {.buffer = inbuf, .attrs = NULL};
+    struct lfs_file_config outcfg = {.buffer = outbuf, .attrs = NULL};
+    lfs_file_t in;
+    lfs_file_t out;
+    lfs_size_t chunk = lfs->cfg->cache_size;
+
+    err = lfs_file_opencfg(lfs, &in, path, LFS_O_RDONLY, &incfg);
+    if (err) {
+        return err;
+    }
+    err = lfs_file_opencfg(lfs, &out, tmp,
+            LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC, &outcfg);
+    if (err) {
+        lfs_file_close(lfs, &in);
+        lfs_remove(lfs, tmp);
+        return err;
+    }
+
+    while (true) {
+        lfs_ssize_t n = lfs_file_read(lfs, &in, copy, chunk);
+        if (n < 0) {
+            err = (int)n;
+            break;
+        }
+        if (n == 0) {
+            err = 0;
+            break;
+        }
+        lfs_ssize_t written = lfs_file_write(lfs, &out, copy, n);
+        if (written != n) {
+            err = (written < 0) ? (int)written : LFS_ERR_IO;
+            break;
+        }
+    }
+    int cerr = lfs_file_close(lfs, &in);
+    if (!err) {
+        err = cerr;
+    }
+    cerr = lfs_file_close(lfs, &out);
+    if (!err) {
+        err = cerr;
+    }
+    if (err) {
+        lfs_remove(lfs, tmp);
+        return err;
+    }
+
+    err = lfs_rename(lfs, tmp, path);
+    if (err) {
+        lfs_remove(lfs, tmp);
+    }
+    return err;
+}
+
+// The scan walks directories by pair, from DIRSTRUCT tags, because a path
+// lookup costs a full metadata scan per component and every tag read reaches
+// flash through a Python callback. It is iterative (one frame per open
+// directory) so a step can stop between entries without using the C stack.
+struct lfs_ext_scan_frame {
+    lfs_block_t pair[2];
+    char path[LFS_EXT_MAX_PATH];
+    uint16_t id;        // next entry of this directory
+    uint16_t tails;     // tail pairs followed so far
+    bool fetched;       // `cur` holds this frame's mdir
+};
+
+enum {
+    LFS_EXT_STATE_RANK,
+    LFS_EXT_STATE_SCAN,
+    LFS_EXT_STATE_WORK,
+    LFS_EXT_STATE_ERASE,
+    LFS_EXT_STATE_DONE,
+};
+
+// One defragmenter at a time: the OS has one root filesystem and serialises
+// installs, and the state is too large for the task stack.
+struct lfs_ext_defrag_state {
+    bool active;
+    bool fixed;
+    bool map_built;
+    bool excluded;
+    lfs_t *lfs;
+    lfs_size_t length;
+    lfs_block_t count;
+    lfs_block_t align;
+    lfs_size_t budget;
+    uint8_t state;
+    lfs_block_t head;
+    lfs_block_t tried[LFS_EXT_DEFRAG_ATTEMPTS];
+    int tried_count;
+    lfs_block_t free_blocks;
+    lfs_size_t moved;
+    int rounds;
+    struct lfs_ext_window w;
+    struct lfs_ext_scan_frame stack[LFS_EXT_MAX_DEPTH+1];
+    int depth;
+    lfs_mdir_t cur;
+    int pair_index;
+    int file_index;
+    lfs_block_t erase_next;
+    lfs_ext_t out;
+    uint8_t file_in[LFS_EXT_CACHE_MAX];
+    uint8_t file_out[LFS_EXT_CACHE_MAX];
+    uint8_t copy[LFS_EXT_CACHE_MAX];
+    lfs_cache_t check;
+    uint8_t check_buf[LFS_EXT_CACHE_MAX];
+};
+
+static struct lfs_ext_defrag_state lfs_ext_defrag_state;
+
+static void lfs_ext_scan_reset(struct lfs_ext_defrag_state *s) {
+    memset(&s->w, 0, sizeof(s->w));
+    s->w.head = s->head;
+    s->w.count = s->count;
+    s->depth = 0;
+    s->stack[0].pair[0] = s->lfs->root[0];
+    s->stack[0].pair[1] = s->lfs->root[1];
+    strcpy(s->stack[0].path, "/");
+    s->stack[0].id = 0;
+    s->stack[0].tails = 0;
+    s->stack[0].fetched = false;
+    s->pair_index = 0;
+    s->file_index = 0;
+    lfs_ext_scan_pair(s->lfs->root, &s->w);
+}
+
+// Process at most one entry (or one directory fetch/pop). Returns 1 while the
+// scan has more to do, 0 when it finished, or a negative error.
+static int lfs_ext_scan_step(struct lfs_ext_defrag_state *s) {
+    lfs_t *lfs = s->lfs;
+
+    if (s->w.reject) {
+        return 0;
+    }
+    if (s->depth < 0) {
+        return 0;
+    }
+
+    struct lfs_ext_scan_frame *frame = &s->stack[s->depth];
+    if (!frame->fetched) {
+        int err = lfs_dir_fetch(lfs, &s->cur, frame->pair);
+        if (err) {
+            return err;
+        }
+        frame->fetched = true;
+        return 1;
+    }
+
+    if (frame->id >= s->cur.count) {
+        if (s->cur.split) {
+            if (++frame->tails > 128) {
+                return LFS_ERR_CORRUPT;
+            }
+            // A split directory's tail pair belongs to this directory and is
+            // not a relocate target; a window holding one is pinned.
+            if (lfs_ext_in_window(s->cur.tail[0], s->head, s->count)
+                    || lfs_ext_in_window(s->cur.tail[1],
+                        s->head, s->count)) {
+                s->w.reject = true;
+                return 0;
+            }
+            int err = lfs_dir_fetch(lfs, &s->cur, s->cur.tail);
+            if (err) {
+                return err;
+            }
+            frame->id = 0;
+            return 1;
+        }
+        if (s->depth == 0) {
+            s->depth = -1;
+            return 0;
+        }
+        // The parent's cursor is kept; its mdir has to be fetched again
+        // because `cur` now holds a descendant.
+        s->depth -= 1;
+        s->stack[s->depth].fetched = false;
+        return 1;
+    }
+
+    uint16_t id = frame->id++;
+    // One lookup covers every data tag: the 0x700 mask keeps the type but not
+    // the chunk, so DIRSTRUCT, INLINESTRUCT, CTZSTRUCT and EXTSTRUCT all
+    // match and are told apart by type3. The first 12 bytes are enough for a
+    // ctz (head/size), a DIRSTRUCT pair and an extent's head/count.
+    union {
+        struct lfs_ctz ctz;
+        lfs_ext_t ext;
+    } data;
+    lfs_stag_t tag = lfs_dir_get(lfs, &s->cur,
+            LFS_MKTAG(0x700, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_STRUCT, id, sizeof(struct lfs_ctz)),
+            &data);
+    if (tag == LFS_ERR_NOENT) {
+        return 1;
+    }
+    if (tag < 0) {
+        return (int)tag;
+    }
+
+    if (lfs_tag_type3(tag) == LFS_TYPE_EXTSTRUCT) {
+        // An extent's payload is immutable: reject the window instead of
+        // moving or writing over it.
+        lfs_block_t ehead = lfs_fromle32((&data.ctz.head)[0]);
+        lfs_block_t ecount = lfs_fromle32((&data.ctz.head)[1]);
+        if (ecount
+                && ehead < s->head + s->count
+                && s->head < ehead + ecount) {
+            s->w.reject = true;
+        }
+        return 1;
+    }
+
+    lfs_block_t child_pair[2] = {0, 0};
+    bool is_dir = false;
+    bool hit = false;
+    lfs_block_t file_blocks = 0;
+    if (lfs_tag_type3(tag) == LFS_TYPE_DIRSTRUCT) {
+        child_pair[0] = (&data.ctz.head)[0];
+        child_pair[1] = (&data.ctz.head)[1];
+        lfs_pair_fromle32(child_pair);
+        is_dir = true;
+    } else if (lfs_tag_type3(tag) == LFS_TYPE_CTZSTRUCT) {
+        lfs_ctz_fromle32(&data.ctz);
+        struct lfs_ext_block_check check = {s->head, s->count, 0, false};
+        int err = lfs_ctz_traverse(lfs, NULL, &s->check,
+                data.ctz.head, data.ctz.size,
+                lfs_ext_block_check_cb, &check);
+        if (err) {
+            return err;
+        }
+        hit = check.hit;
+        file_blocks = check.blocks;
+    } else {
+        // Inline data (or no data tag): nothing outside the pair.
+        return 1;
+    }
+
+    if (!is_dir && !hit) {
+        return 1;
+    }
+
+    // The name is only needed for entries the window keeps, and it is another
+    // full metadata scan.
+    lfs_stag_t ntag = lfs_dir_get(lfs, &s->cur,
+            LFS_MKTAG(0x780, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_NAME, id, LFS_NAME_MAX+1),
+            s->w.info.name);
+    if (ntag == LFS_ERR_NOENT) {
+        return 1;
+    }
+    if (ntag < 0) {
+        return (int)ntag;
+    }
+    s->w.info.name[lfs_tag_size(ntag)] = '\0';
+
+    lfs_size_t plen = strlen(frame->path);
+    lfs_size_t nlen = strlen(s->w.info.name);
+    bool slash = strcmp(frame->path, "/") != 0;
+    if (plen + (slash ? 1 : 0) + nlen + 1 > LFS_EXT_MAX_PATH) {
+        // Cannot address the entry; the final used-map check refuses a window
+        // it occupies.
+        return 1;
+    }
+    char child[LFS_EXT_MAX_PATH];
+    memcpy(child, frame->path, plen);
+    lfs_size_t o = plen;
+    if (slash) {
+        child[o++] = '/';
+    }
+    memcpy(child + o, s->w.info.name, nlen);
+    child[o + nlen] = '\0';
+
+    if (is_dir) {
+        int err = lfs_ext_scan_pair(child_pair, &s->w);
+        if (err || s->w.reject) {
+            return err;
+        }
+        if (s->depth < LFS_EXT_MAX_DEPTH) {
+            s->depth += 1;
+            struct lfs_ext_scan_frame *child_frame = &s->stack[s->depth];
+            child_frame->pair[0] = child_pair[0];
+            child_frame->pair[1] = child_pair[1];
+            memcpy(child_frame->path, child, o + nlen + 1);
+            child_frame->id = 0;
+            child_frame->tails = 0;
+            child_frame->fetched = false;
+        }
+        return 1;
+    }
+
+    if (s->w.file_count >= LFS_EXT_MAX_OCCUPANTS) {
+        // More than one round can carry; the next round picks these up.
+        return 1;
+    }
+    struct lfs_ext_occupant *occ = &s->w.files[s->w.file_count];
+    memcpy(occ->path, child, o + nlen + 1);
+    occ->size = data.ctz.size;
+    occ->blocks = file_blocks;
+    s->w.file_count += 1;
+    s->w.moved_blocks += file_blocks + 1;
+    if (file_blocks > s->w.max_file_blocks) {
+        s->w.max_file_blocks = file_blocks;
+    }
+    return 1;
+}
+
+static int lfs_ext_defrag_begin_common(lfs_t *lfs, lfs_size_t length,
+        lfs_block_t align, lfs_size_t budget_blocks, bool fixed,
+        lfs_block_t head, lfs_block_t count) {
+    if (lfs_ext_defrag_state.active || lfs->ext_bitmap) {
+        return LFS_ERR_INVAL;
+    }
+    if (align == 0) {
+        align = 1;
+    }
+    lfs_size_t bs = lfs->cfg->block_size;
+    if (count == 0) {
+        count = (length + bs - 1) / bs;
+    }
+    if (count == 0 || count > lfs->block_count
+            || (fixed && head >= lfs->block_count)
+            || (fixed && count > lfs->block_count - head)) {
+        return LFS_ERR_NOSPC;
+    }
+    if (lfs_ext_map_size(lfs) > LFS_EXT_MAP_MAX
+            || lfs->cfg->cache_size > LFS_EXT_CACHE_MAX) {
+        return LFS_ERR_NOMEM;
+    }
+
+    memset(&lfs_ext_defrag_state, 0, sizeof(lfs_ext_defrag_state));
+    struct lfs_ext_defrag_state *s = &lfs_ext_defrag_state;
+    // A private read cache for the per-entry data-block walks: reusing the
+    // shared one would evict the directory block that the next entry's tag
+    // scan needs.
+    s->check.buffer = s->check_buf;
+    s->check.block = LFS_BLOCK_NULL;
+    s->active = true;
+    s->fixed = fixed;
+    s->lfs = lfs;
+    s->length = length;
+    s->count = count;
+    s->align = align;
+    s->budget = budget_blocks;
+    s->head = head;
+    s->state = LFS_EXT_STATE_RANK;
+    return 0;
+}
+
+int lfs_ext_defrag_begin(lfs_t *lfs, lfs_size_t length,
+        lfs_block_t align, lfs_size_t budget_blocks) {
+    if (length == 0) {
+        return LFS_ERR_INVAL;
+    }
+    return lfs_ext_defrag_begin_common(lfs, length, align, budget_blocks,
+            false, LFS_BLOCK_NULL, 0);
+}
+
+void lfs_ext_defrag_abort(lfs_t *lfs) {
+    struct lfs_ext_defrag_state *s = &lfs_ext_defrag_state;
+    if (!s->active) {
+        return;
+    }
+    if (s->excluded) {
+        lfs_ext_clear_exclude(lfs);
+    }
+    s->active = false;
+}
+
+int lfs_ext_defrag_result(lfs_t *lfs, lfs_ext_t *out) {
+    (void)lfs;
+    if (!out || lfs_ext_defrag_state.state != LFS_EXT_STATE_DONE) {
+        return LFS_ERR_INVAL;
+    }
+    *out = lfs_ext_defrag_state.out;
+    return 0;
+}
+
+// Run one bounded unit of work. Returns 1 while there is more to do, 0 when the
+// window is cleared (and, for a reservation, the run is reserved), or a
+// negative error. `phase`/`percent` may be NULL.
+static int lfs_ext_reserve_mark(lfs_t *lfs, lfs_block_t head,
+        lfs_block_t count, lfs_size_t length, lfs_ext_t *out);
+
+int lfs_ext_defrag_step(lfs_t *lfs, uint8_t *phase, uint8_t *percent) {
+    struct lfs_ext_defrag_state *s = &lfs_ext_defrag_state;
+    if (!s->active || s->lfs != lfs) {
+        return LFS_ERR_INVAL;
+    }
+
+    int err = 0;
+    switch (s->state) {
+    case LFS_EXT_STATE_RANK: {
+        if (!s->map_built) {
+            err = lfs_ext_used_into(lfs, lfs->ext_map);
+            if (err) {
+                break;
+            }
+            lfs_block_t used_blocks = 0;
+            for (lfs_block_t b = 0; b < lfs->block_count; b++) {
+                used_blocks += lfs_ext_map_get(lfs->ext_map, b);
+            }
+            // Moving a file frees its old blocks inside the window and takes
+            // its copy from outside it, so this is a lower bound.
+            s->free_blocks = lfs->block_count - used_blocks;
+            s->map_built = true;
+        }
+
+        if (s->fixed) {
+            if (lfs_ext_in_window(0, s->head, s->count)
+                    || lfs_ext_in_window(1, s->head, s->count)) {
+                err = LFS_ERR_NOSPC;
+                break;
+            }
+            s->state = LFS_EXT_STATE_SCAN;
+            lfs_ext_scan_reset(s);
+            break;
+        }
+
+        // Rank the aligned windows by how many used blocks they hold and take
+        // the best one not tried yet.
+        lfs_block_t best = LFS_BLOCK_NULL;
+        lfs_block_t best_used = 0;
+        for (lfs_block_t h = 0; h + s->count <= lfs->block_count;
+                h += s->align) {
+            bool skip = false;
+            for (int i = 0; i < s->tried_count; i++) {
+                if (s->tried[i] == h) {
+                    skip = true;
+                    break;
+                }
+            }
+            if (skip) {
+                continue;
+            }
+            lfs_block_t in_window = 0;
+            for (lfs_block_t b = h; b < h+s->count; b++) {
+                in_window += lfs_ext_map_get(lfs->ext_map, b);
+            }
+            if (best == LFS_BLOCK_NULL || in_window < best_used) {
+                best = h;
+                best_used = in_window;
+            }
+        }
+        if (best == LFS_BLOCK_NULL || s->tried_count >= LFS_EXT_DEFRAG_ATTEMPTS) {
+            err = LFS_ERR_NOSPC;
+            break;
+        }
+        s->tried[s->tried_count++] = best;
+        s->head = best;
+        s->state = LFS_EXT_STATE_SCAN;
+        lfs_ext_scan_reset(s);
+        break;
+    }
+
+    case LFS_EXT_STATE_SCAN: {
+        int res = lfs_ext_scan_step(s);
+        if (res < 0) {
+            err = res;
+            break;
+        }
+        if (res > 0) {
+            break;
+        }
+        if (s->w.reject) {
+            // Unusable window: drop it and look for another.
+            if (s->fixed) {
+                err = LFS_ERR_NOSPC;
+            } else {
+                s->state = LFS_EXT_STATE_RANK;
+                s->map_built = false;
+            }
+            break;
+        }
+        if (s->w.pair_count == 0 && s->w.file_count == 0) {
+            // Nothing live is left in the window.
+            if (s->fixed) {
+                s->state = LFS_EXT_STATE_DONE;
+            } else {
+                s->state = LFS_EXT_STATE_ERASE;
+                s->erase_next = s->head;
+            }
+            break;
+        }
+        if (s->budget && s->moved + s->w.moved_blocks > s->budget) {
+            err = LFS_ERR_NOSPC;
+            break;
+        }
+        if (lfs_ext_open_hits(lfs, s->head, s->count)) {
+            // An open file's blocks are in this window, so it cannot be
+            // cleared. Drop this candidate and let the rank pick another.
+            if (s->fixed) {
+                err = LFS_ERR_NOSPC;
+            } else {
+                s->state = LFS_EXT_STATE_RANK;
+                s->map_built = false;
+            }
+            break;
+        }
+        if (s->free_blocks < s->w.max_file_blocks + 2 + 2*s->w.pair_count) {
+            err = LFS_ERR_NOSPC;
+            break;
+        }
+
+        err = lfs_ext_exclude(lfs, s->head, s->count);
+        if (err) {
+            break;
+        }
+        s->excluded = true;
+        s->state = LFS_EXT_STATE_WORK;
+        break;
+    }
+
+    case LFS_EXT_STATE_WORK: {
+        if (s->pair_index < s->w.pair_count) {
+            lfs_block_t pair[2] = {
+                s->w.pairs[s->pair_index][0],
+                s->w.pairs[s->pair_index][1],
+            };
+            s->pair_index += 1;
+            int res = lfs_ext_relocate_dir(lfs, pair);
+            if (res && res != LFS_ERR_NOSPC) {
+                err = res;
+            }
+            break;
+        }
+        if (s->file_index < s->w.file_count) {
+            int res = lfs_ext_move_file(lfs,
+                    s->w.files[s->file_index].path,
+                    s->file_in, s->file_out, s->copy);
+            s->file_index += 1;
+            if (res) {
+                err = res;
+            }
+            break;
+        }
+
+        // This round's occupants are out; scan again for the next round.
+        s->moved += s->w.moved_blocks;
+        lfs_ext_clear_exclude(lfs);
+        s->excluded = false;
+        s->rounds += 1;
+        // An occupant holds at least one block, so this bounds the rounds.
+        if (s->rounds > (int)(s->count / LFS_EXT_MAX_OCCUPANTS) + 2) {
+            err = LFS_ERR_NOSPC;
+            break;
+        }
+        s->state = LFS_EXT_STATE_SCAN;
+        lfs_ext_scan_reset(s);
+        break;
+    }
+
+    case LFS_EXT_STATE_ERASE: {
+        bool corrupt = false;
+        for (int i = 0; i < 8 && s->erase_next < s->head + s->count; i++) {
+            int res = lfs_bd_erase(lfs, s->erase_next);
+            s->erase_next += 1;
+            if (res) {
+                if (res == LFS_ERR_CORRUPT) {
+                    corrupt = true;
+                    break;
+                }
+                err = res;
+                break;
+            }
+        }
+        if (err) {
+            break;
+        }
+        if (corrupt) {
+            // A bad block disqualifies this window; try the next one.
+            s->map_built = false;
+            s->state = LFS_EXT_STATE_RANK;
+            break;
+        }
+        if (s->erase_next < s->head + s->count) {
+            break;
+        }
+        err = lfs_ext_reserve_mark(lfs, s->head, s->count, s->length,
+                &s->out);
+        if (err) {
+            break;
+        }
+        s->excluded = false;    // the reservation owns the map now
+        s->state = LFS_EXT_STATE_DONE;
+        break;
+    }
+
+    case LFS_EXT_STATE_DONE:
+        break;
+    }
+
+    if (err) {
+        lfs_ext_defrag_abort(lfs);
+        return err;
+    }
+
+    if (phase) {
+        if (s->state == LFS_EXT_STATE_RANK
+                || s->state == LFS_EXT_STATE_SCAN) {
+            *phase = LFS_EXT_PHASE_SPACE;
+        } else if (s->state == LFS_EXT_STATE_WORK) {
+            *phase = LFS_EXT_PHASE_MOVE;
+        } else {
+            *phase = LFS_EXT_PHASE_ERASE;
+        }
+    }
+    if (percent) {
+        if (s->state == LFS_EXT_STATE_WORK) {
+            int total = s->w.pair_count + s->w.file_count;
+            int done = s->pair_index + s->file_index;
+            *percent = total ? (uint8_t)((done * 100) / total) : 100;
+        } else if (s->state == LFS_EXT_STATE_ERASE) {
+            *percent = s->count
+                    ? (uint8_t)(((s->erase_next - s->head) * 100) / s->count)
+                    : 100;
+        } else if (s->state == LFS_EXT_STATE_DONE) {
+            *percent = 100;
+        } else {
+            *percent = 0;
+        }
+    }
+
+    return (s->state == LFS_EXT_STATE_DONE) ? 0 : 1;
+}
+
+// Turn a cleared window into a reservation, as lfs_ext_reserve() does after
+// its search.
+static int lfs_ext_reserve_mark(lfs_t *lfs, lfs_block_t head,
+        lfs_block_t count, lfs_size_t length, lfs_ext_t *out) {
+    lfs_size_t size = lfs_ext_map_size(lfs);
+    memset(lfs->ext_map, 0, size);
+    lfs->ext_bitmap = lfs->ext_map;
+    lfs->ext_head = head;
+    lfs->ext_count = count;
+    lfs->ext_length = length;
+    for (lfs_block_t b = head; b < head+count; b++) {
+        lfs_ext_map_set(lfs->ext_bitmap, b);
+    }
+    out->head = head;
+    out->count = count;
+    out->length = length;
+    out->crc = 0;
+    out->flags = 0;
+    return 0;
+}
+
+int lfs_ext_clear_window(lfs_t *lfs, lfs_block_t head, lfs_block_t count,
+        lfs_size_t budget_blocks) {
+    int err = lfs_ext_defrag_begin_common(lfs, 0, 1, budget_blocks,
+            true, head, count);
+    if (err) {
+        return err;
+    }
+    while ((err = lfs_ext_defrag_step(lfs, NULL, NULL)) > 0) {
+    }
+    if (err < 0) {
+        return err;
+    }
+    return 0;
+}
+
+int lfs_ext_defrag(lfs_t *lfs, lfs_size_t length, lfs_block_t align,
+        lfs_size_t budget_blocks, lfs_ext_t *out) {
+    int err = lfs_ext_defrag_begin(lfs, length, align, budget_blocks);
+    if (err) {
+        return err;
+    }
+    while ((err = lfs_ext_defrag_step(lfs, NULL, NULL)) > 0) {
+    }
+    if (err < 0) {
+        return err;
+    }
+    err = lfs_ext_defrag_result(lfs, out);
+    lfs_ext_defrag_abort(lfs);
+    return err;
+}
+
+#endif
+
+lfs_size_t lfs_fs_block_count(lfs_t *lfs) {
+    return lfs->block_count;
+}
+
 int lfs_format(lfs_t *lfs, const struct lfs_config *cfg) {
     int err = LFS_LOCK(cfg);
     if (err) {
@@ -6008,6 +7613,13 @@ int lfs_format(lfs_t *lfs, const struct lfs_config *cfg) {
 #endif
 
 int lfs_mount(lfs_t *lfs, const struct lfs_config *cfg) {
+    // A mount invalidates a defragmenter that was in flight: it can only be
+    // left behind by a non-local exit (a power-loss injection, an aborted
+    // bytecode), and its window no longer describes the filesystem.
+    if (lfs_ext_defrag_state.active) {
+        memset(&lfs_ext_defrag_state, 0, sizeof(lfs_ext_defrag_state));
+    }
+
     int err = LFS_LOCK(cfg);
     if (err) {
         return err;

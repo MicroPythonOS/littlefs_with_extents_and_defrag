@@ -121,6 +121,10 @@ endif
 
 TESTFLAGS  += -b
 BENCHFLAGS += -b
+# The extent and defragmentation cases share helpers in
+# relocate_test_helpers.h. That header includes runners/test_runner.h
+# itself, so injecting it into every generated case file is safe.
+TESTCFLAGS += --include=relocate_test_helpers.h
 # forward -j flag
 TESTFLAGS  += $(filter -j%,$(MAKEFLAGS))
 BENCHFLAGS += $(filter -j%,$(MAKEFLAGS))

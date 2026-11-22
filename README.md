@@ -134,6 +134,28 @@ from memory, otherwise data integrity can not be guaranteed. If the `write`
 function does not perform caching, and therefore each `read` or `write` call
 hits the memory, the `sync` function can simply return 0.
 
+## Extents and defragmentation
+
+This fork adds **extent files**: immutable, contiguous runs of blocks that a
+file can be committed into, plus a **defragmenter** that clears a window of
+blocks and reserves it as such a run. They exist so an embedded system can run
+code directly out of flash, where the code must occupy one aligned run rather
+than the scattered blocks a normal write produces.
+
+``` c
+lfs_ext_t ext;
+if (lfs_ext_reserve(&lfs, length, 16, &ext) == LFS_ERR_NOCONTIG) {
+    lfs_ext_defrag(&lfs, length, 16, &ext);
+}
+lfs_ext_write(&lfs, 0, buffer, length);
+lfs_ext_commit(&lfs, "engine.bin", crc);
+```
+
+The disk version is unchanged (2.1). Stock littlefs can mount an image that
+contains extents but cannot read or count them, so **treat such an image as
+read-only outside this fork**. See [EXTENTS.md](EXTENTS.md) for the on-disk
+format, the API, the defragmentation algorithm and its limits.
+
 ## Design
 
 At a high level, littlefs is a block based filesystem that uses small logs to
